@@ -1,0 +1,185 @@
+#!/bin/bash
+#
+# Malloc Detective: Analyser
+#
+# ---------------------------------------------------------------------------
+# Copyright (c) 2015 Ayumu Koujiya
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy 
+# of this software and associated documentation files (the "Software"), to
+# deal in the Software without restriction, including without limitation the 
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is 
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+
+usage_exit() {
+    echo "Usage: $0 [-C] [-c] [-e addr2line target-file] [malloc_detective output]" > /dev/stderr
+    exit 1
+}
+
+DEMANGLE=cat
+COUNT_MODE=0
+ANALYSE_MODE=1
+MODE=$ANALYSE_MODE
+
+# option check
+while getopts e:cCh OPT; do
+    case $OPT in
+    e)  ADDR2LINE_TARGET=$OPTARG
+        ;;
+    c)  MODE=$COUNT_MODE
+        ;;
+    C)  DEMANGLE=c++filt
+        ;;
+    h)  usage_exit
+        ;;
+    esac
+done
+shift $(($OPTIND - 1))
+
+
+# -----------------------------
+# filter & formatter functions
+# -----------------------------
+
+filter_leak_malloc() {
+    gawk '
+        BEGIN { FS = "\t" }
+        # format check and processing
+        $1 ~ /^[-0-9]+T[:0-9]+$/ &&
+            $2 ~ /^[0-9]+$/ &&
+            ($3 == "malloc" || $3 == "free") &&
+            $4 ~ /^0x[0-9a-fA-F]+$/ &&
+            $5~ /^[0-9]+$/
+        {
+            if ($3 == "malloc") {
+                record[$2,$4] = $0
+            } else if ($3 == "free") {
+                delete record[$2,$4]
+            }
+        }
+        # END: show memory leak information
+        END {
+            for (pid_addr in record) {
+                print record[pid_addr]
+            }
+        }
+    ' < /dev/stdin
+}
+
+reformat_readable() {
+    gawk '
+        BEGIN { FS = "\t" }
+        {
+            time = $1
+            pid = $2
+            address = $4
+            size = $5
+            # remove without backtrace
+            sub(/^[[:print:]]+\t[[:print:]]+\t[[:print:]]+\t[[:print:]]+\t[[:print:]]+\t/, "")
+            # print each memory leak.
+            printf("%s: pid=%s address=%s size=%s",time,pid,address,size)
+            n = split($0, bt, /\t/)
+            for (i = 0; i < n; i++) {
+                printf("    %s\n", bt[i])
+            }
+        }
+    ' < /dev/stdin
+}
+
+reformat_readable_for_counter() {
+    gawk '
+        BEGIN { FS = "\t" }
+        {
+            count = $1
+            # remove without backtrace
+            sub(/^[ 0-9]+/, "")
+            printf("%d", count)
+            n = split($0, bt, /\t/)
+            for (i = 0; i < n; i++) {
+                printf("    %s\n", bt[i])
+            }
+        }
+    ' < /dev/stdin
+}
+
+convert_addr2line() {
+    if [ "_$ADDR2LINE_TARGET" = "_" ]; then
+        cat < /dev/stdin
+    else
+        TEMP_INPUT=$(mktemp)
+        TEMP_ADDRS=$(mktemp)
+        TEMP_LINES=$(mktemp)
+        TEMP_ADDR2LINE=$(mktemp)
+        trap "/bin/rm $TEMP_INPUT $TEMP_ADDRS $TEMP_LINES  $TEMP_ADDR2LINE" EXIT
+        cat < /dev/stdin > $TEMP_INPUT
+        grep -F "${ADDR2LINE_TARGET}(" $TEMP_INPUT | sed 's/^.*\[//;s/\].*$//' | sort -u >  $TEMP_ADDRS
+        cat $TEMP_ADDRS | addr2line -e $ADDR2LINE_TARGET > $TEMP_LINES
+        paste $TEMP_ADDRS $TEMP_LINES > $TEMP_ADDR2LINE
+        gawk -v EXENAME="$ADDR2LINE_TARGET" -v ADDR2LINE="$TEMP_ADDR2LINE" '
+            BEGIN {
+                FS="\t"
+                while ((getline < ADDR2LINE) > 0) {
+                    addr2line[$1] = $2
+                }
+                matchstr = sprintf("^    [[:print:]]*%s\\(", EXENAME)
+            }
+            $0 ~ matchstr {
+                match($0, /\[0x[0-9a-fA-F]+\]/)
+                addr = substr($0, RSTART+1, RLENGTH-2)
+                print $0, addr2line[addr]
+                next
+            }
+            { print $0 }
+        ' $TEMP_INPUT
+    fi < /dev/stdin
+}
+
+demangle() {
+    $DEMANGLE < /dev/stdin
+}
+
+remove_without_backtrace()
+{
+    sed 's/^[[:print:]]\+\t[[:print:]]\+\t[[:print:]]\+\t[[:print:]]\+\t[[:print:]]\+\t//' < /dev/stdin
+}
+
+
+# -----------------------------
+# main
+# -----------------------------
+
+if [ "_$MODE" = "_$ANALYSE_MODE" ]; then
+    ( [ $# -le 0 ] && cat /dev/stdin || cat "$@" ) |
+    filter_leak_malloc |
+    sort |
+    reformat_readable |
+    convert_addr2line |
+    demangle
+elif [ "_$MODE" = "_$COUNT_MODE" ]; then
+    ( [ $# -le 0 ] && cat /dev/stdin || cat "$@" ) |
+    filter_leak_malloc |
+    remove_without_backtrace |
+    sort |
+    uniq -c |
+    sort -n |
+    reformat_readable_for_counter |
+    convert_addr2line |
+    demangle
+fi
+
+
+# vim: ts=4 sts=4 sw=4 expandtab
+
